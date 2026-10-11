@@ -167,12 +167,28 @@ router.patch(
 router.delete(
   '/',
   asyncHandler(async (req: Request, res: Response) => {
-    await prisma.user.update({
-      where: { id: req.user!.userId },
-      data: { isActive: false },
-    });
+    const userId = req.user!.userId;
 
-    res.json({ success: true, message: 'Account deactivated' });
+    // Play/NDPA-compliant deletion: strip personal data and deactivate.
+    // Delivery/payment records stay (bookkeeping + dispute resolution, per
+    // the privacy policy) but are no longer linked to a reachable identity.
+    await prisma.$transaction([
+      prisma.savedLocation.deleteMany({ where: { userId } }),
+      prisma.user.update({
+        where: { id: userId },
+        data: {
+          email: null,
+          phone: null,
+          firstName: 'Deleted',
+          lastName: 'User',
+          avatarUrl: null,
+          passwordHash: null,
+          isActive: false,
+        },
+      }),
+    ]);
+
+    res.json({ success: true, message: 'Account deleted' });
   })
 );
 
