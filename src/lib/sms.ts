@@ -7,7 +7,7 @@ import { config } from '../config';
  */
 export async function sendSms(to: string, message: string): Promise<boolean> {
   if (!config.termii.apiKey) {
-    console.log(`[DEV] SMS to ${to}: ${message}`);
+    console.log(`[SMS] No provider configured; skipped send to ${to}`);
     return false;
   }
 
@@ -20,7 +20,9 @@ export async function sendSms(to: string, message: string): Promise<boolean> {
         from: config.termii.senderId,
         sms: message,
         type: 'plain',
-        channel: 'generic',
+        // 'dnd' is Termii's transactional route: reaches DND-listed numbers and
+        // isn't time-restricted like 'generic'. Needs an approved sender ID.
+        channel: process.env.TERMII_CHANNEL || 'dnd',
         api_key: config.termii.apiKey,
       }),
     });

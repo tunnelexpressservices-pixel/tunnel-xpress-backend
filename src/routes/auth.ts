@@ -10,6 +10,8 @@ import { createOTP, verifyOTP } from '../lib/otp';
 import { sendOtpEmail } from '../lib/email';
 import { sendOtpSms, smsProviderConfigured } from '../lib/sms';
 import { generateReferralCode } from '../lib/generators';
+
+const SEND_FAIL = "We couldn't send your verification code. Please try again in a moment.";
 import {
   registerEmailSchema,
   registerGoogleSchema,
@@ -135,7 +137,7 @@ router.post(
 
     // Send verification OTP
     const otpCode = await createOTP(email);
-    console.log(`[DEV] Email OTP for ${email}: ${otpCode}`);
+    // Non-fatal: the account exists either way, and the app offers Resend.
     await sendOtpEmail(email, otpCode);
 
     const tokens = generateTokenPair({ userId: user.id, role: user.role });
@@ -266,7 +268,8 @@ router.post(
     if (!user.isActive) throw new AppError('Account is deactivated', 403);
 
     const otpCode = await createOTP(phone);
-    await sendOtpSms(phone, otpCode);
+    const smsSent = await sendOtpSms(phone, otpCode);
+    if (smsProviderConfigured() && !smsSent) throw new AppError(SEND_FAIL, 502);
 
     res.json({
       success: true,
@@ -332,11 +335,10 @@ router.post(
 
     const otpCode = await createOTP(identifier);
     const isEmail = identifier.includes('@');
-    if (isEmail) {
-      await sendOtpEmail(identifier, otpCode);
-    } else {
-      await sendOtpSms(identifier, otpCode);
-    }
+    const sent = isEmail
+      ? (await sendOtpEmail(identifier, otpCode)).sent
+      : (await sendOtpSms(identifier, otpCode)) || !smsProviderConfigured();
+    if (!sent) throw new AppError(SEND_FAIL, 502);
 
     res.json({
       success: true,
@@ -364,8 +366,7 @@ router.post(
     }
 
     const otpCode = await createOTP(email);
-    console.log(`[DEV] Password reset OTP for ${email}: ${otpCode}`);
-    await sendOtpEmail(email, otpCode);
+    if (!(await sendOtpEmail(email, otpCode)).sent) throw new AppError(SEND_FAIL, 502);
 
     res.json({
       success: true,
