@@ -27,6 +27,17 @@ if (FAKE_PAYMENTS) {
 
 router.use(authenticate);
 
+/** Paid order → rider pool: FINDING_RIDER + notify riders. Idempotent per call site. */
+async function releaseToRiders(deliveryId: string) {
+  const finding = await prisma.delivery.update({
+    where: { id: deliveryId },
+    data: { status: 'FINDING_RIDER', paidAt: new Date() },
+    select: { id: true, orderTag: true, pickupAddress: true, dropoffAddress: true, totalFee: true, distanceKm: true, packageName: true, riderType: true },
+  });
+  emitToRiders('rider:newDelivery', finding);
+  notifyRidersOfNewDelivery(finding.id).catch(() => {});
+}
+
 // ─── INITIALIZE PAYMENT ─────────────────────────────────
 
 router.post(
@@ -61,6 +72,27 @@ router.post(
     });
 
     const reference = `TXN_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+
+    // ─── WALLET / COUPON ────────────────────────────────
+    // Paid from the user's earned balance — no Paystack involved. The
+    // conditional decrement makes a double-tap or race unable to overdraw.
+    if (method === 'WALLET') {
+      const paid = await prisma.$transaction(async (tx) => {
+        const debit = await tx.wallet.updateMany({
+          where: { userId: req.user!.userId, balance: { gte: delivery.totalFee } },
+          data: { balance: { decrement: delivery.totalFee } },
+        });
+        if (debit.count === 0) return null;
+        return tx.payment.upsert({
+          where: { deliveryId },
+          update: { amount: delivery.totalFee, method, status: 'SUCCESS', paystackRef: reference },
+          create: { deliveryId, userId: req.user!.userId, amount: delivery.totalFee, method, status: 'SUCCESS', paystackRef: reference },
+        });
+      });
+      if (!paid) throw new AppError('Your coupon balance is not enough for this delivery. Please choose another payment method.', 400);
+      await releaseToRiders(deliveryId);
+      return res.json({ success: true, data: { payment: paid, requiresAction: false, reference } });
+    }
 
     // ─── FAKE MODE ──────────────────────────────────────
     // No Paystack key configured: pretend the charge succeeded immediately.
@@ -158,12 +190,47 @@ router.post(
       });
     }
 
-    // Initialize new Paystack transaction
+    // ─── BANK TRANSFER / OPAY ───────────────────────────
+    // Paystack issues a one-time account number for this exact amount; the app
+    // shows it and polls /verify (the webhook also completes it if the user
+    // leaves). Opay users pay the same way, from their Opay app.
+    if (method === 'BANK_TRANSFER' || method === 'OPAY') {
+      const charge = await chargeBankTransfer(
+        user!.email!,
+        delivery.totalFee * 100,
+        reference,
+        { deliveryId, userId: req.user!.userId },
+      );
+      const payment = await prisma.payment.upsert({
+        where: { deliveryId },
+        update: { amount: delivery.totalFee, method, paystackRef: reference, status: 'PENDING' },
+        create: { deliveryId, userId: req.user!.userId, amount: delivery.totalFee, method, paystackRef: reference },
+      });
+      return res.json({
+        success: true,
+        data: {
+          payment,
+          requiresAction: true,
+          reference,
+          transfer: {
+            bankName: charge.bank?.name,
+            accountNumber: charge.account_number,
+            accountName: charge.account_name,
+            amount: delivery.totalFee,
+            expiresAt: charge.account_expires_at,
+          },
+        },
+      });
+    }
+
+    // Initialize new Paystack transaction (hosted checkout). All channels stay
+    // enabled: app builds ≤1.1.2 send every payment as CARD, and their users
+    // still need transfer/USSD on this page.
     const initResponse = await initializePaystackTransaction(
       user!.email!,
       delivery.totalFee * 100,
       reference,
-      { deliveryId, userId: req.user!.userId }
+      { deliveryId, userId: req.user!.userId },
     );
 
     const payment = await prisma.payment.upsert({
@@ -213,20 +280,23 @@ router.post(
       throw new AppError('Not authorized', 403);
     }
 
+    // Already settled (e.g. the webhook confirmed a transfer first): report it
+    // without touching the delivery — a rider may already have accepted it.
+    if (payment.status === 'SUCCESS') {
+      return res.json({
+        success: true,
+        message: 'Payment verified successfully',
+        data: { status: 'SUCCESS', deliveryId: payment.deliveryId },
+      });
+    }
+
     // ─── FAKE MODE ──────────────────────────────────────
     if (FAKE_PAYMENTS) {
-      if (payment.status !== 'SUCCESS') {
-        await prisma.payment.update({
-          where: { id: payment.id },
-          data: { status: 'SUCCESS' },
-        });
-        await prisma.delivery.update({
-          where: { id: payment.deliveryId },
-          data: { status: 'FINDING_RIDER', paidAt: new Date() },
-        });
-        emitToRiders('rider:newDelivery', { deliveryId: payment.deliveryId });
-        notifyRidersOfNewDelivery(payment.deliveryId).catch(() => {});
-      }
+      await prisma.payment.update({
+        where: { id: payment.id },
+        data: { status: 'SUCCESS' },
+      });
+      await releaseToRiders(payment.deliveryId);
       return res.json({
         success: true,
         message: 'Payment verified successfully (fake mode)',
@@ -400,10 +470,9 @@ export async function handlePaystackWebhook(req: Request, res: Response) {
         data: { status: 'SUCCESS' },
       });
 
-      await prisma.delivery.update({
-        where: { id: payment.deliveryId },
-        data: { status: 'PAID', paidAt: new Date() },
-      });
+      // Same as /verify: paid orders go straight to the rider pool. Transfers
+      // often confirm here after the customer has closed the app.
+      await releaseToRiders(payment.deliveryId);
     }
   }
 
@@ -416,7 +485,8 @@ async function initializePaystackTransaction(
   email: string,
   amountKobo: number,
   reference: string,
-  metadata: Record<string, string>
+  metadata: Record<string, string>,
+  channels?: string[],
 ) {
   const response = await fetch('https://api.paystack.co/transaction/initialize', {
     method: 'POST',
@@ -430,6 +500,7 @@ async function initializePaystackTransaction(
       reference,
       metadata,
       currency: 'NGN',
+      ...(channels ? { channels } : {}),
       // After paying, Paystack sends the user here — a small app page that
       // closes the checkout tab; the original tab's polling completes the flow.
       callback_url: process.env.PAYSTACK_CALLBACK_URL || 'https://tunnel-express.vercel.app/checkout-complete',
@@ -438,6 +509,34 @@ async function initializePaystackTransaction(
 
   const data: any = await response.json();
   if (!data.status) throw new AppError('Failed to initialize payment', 502);
+  return data.data;
+}
+
+async function chargeBankTransfer(
+  email: string,
+  amountKobo: number,
+  reference: string,
+  metadata: Record<string, string>,
+) {
+  const response = await fetch('https://api.paystack.co/charge', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${config.paystack.secretKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      email,
+      amount: amountKobo,
+      reference,
+      metadata,
+      bank_transfer: { account_expires_at: new Date(Date.now() + 30 * 60 * 1000).toISOString() },
+    }),
+  });
+  const data: any = await response.json();
+  if (!data.status || !data.data?.account_number) {
+    console.error('[payments] bank transfer charge failed:', response.status, data?.message);
+    throw new AppError('Could not set up the bank transfer. Please try again or pay by card.', 502);
+  }
   return data.data;
 }
 
